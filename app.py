@@ -140,6 +140,30 @@ st.success(
     f"({df['open_time'].min().date()} to {df['open_time'].max().date()})"
 )
 
+# ---- Freshness check ----
+latest_utc = raw["open_time"].max()
+latest_local = latest_utc.tz_convert(ZoneInfo(tz_name))
+now_utc = datetime.now(timezone.utc)
+staleness = now_utc - latest_utc.to_pydatetime()
+staleness_hours = staleness.total_seconds() / 3600
+
+f1, f2 = st.columns(2)
+f1.metric("Most recent candle", latest_local.strftime("%Y-%m-%d %H:%M") + f" ({tz_label.split(' ')[0]})")
+if staleness_hours <= 2:
+    f2.success(f"Data is current — last candle is ~{staleness_hours:.1f}h old.")
+elif staleness_hours <= 6:
+    f2.warning(f"Last candle is {staleness_hours:.1f}h old — slightly behind live.")
+else:
+    f2.error(f"Last candle is {staleness_hours:.1f}h old — data may be stale, try refreshing.")
+
+st.caption(
+    "Note: the most recent hour shown may still be **in progress** on the exchange "
+    "(its range will grow until the hour closes), so treat the very last row with "
+    "that in mind when comparing it to fully-closed hours."
+)
+
+st.divider()
+
 # ---- Top line stats ----
 overall_max = df.loc[df["range"].idxmax()]
 c1, c2, c3, c4 = st.columns(4)
