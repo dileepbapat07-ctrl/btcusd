@@ -20,8 +20,10 @@ from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="BTC Hourly Range Explorer", layout="wide")
 
-KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC"
-KRAKEN_PAIRS = {"BTCUSDT": "XBTUSD", "ETHUSDT": "ETHUSD"}
+COINBASE_CANDLES_URL = "https://api.exchange.coinbase.com/products/{product_id}/candles"
+COINBASE_PRODUCTS = {"BTCUSDT": "BTC-USD", "ETHUSDT": "ETH-USD"}
+COINBASE_MAX_CANDLES_PER_CALL = 300  # Coinbase's hard cap per request
+GRANULARITY_SECONDS = 3600  # 1 hour
 
 TIMEZONES = {
     "UTC": "UTC",
@@ -38,53 +40,49 @@ BUCKET_LABELS = ["0-100", "100-200", "200-300", "300-400", "400-500", "500+"]
 @st.cache_data(ttl=60 * 30, show_spinner=False)
 def fetch_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
     """
-    Pull hourly OHLC from Kraken's public API (no key required, not
-    geo-blocked). Kraken returns at most 720 candles per call, so we page
-    forward using the 'since' cursor until we reach the end of the window.
+    Pull hourly OHLC from Coinbase Exchange's public candles endpoint.
+    No key required, not geo-blocked, and unlike Kraken's OHLC endpoint
+    (hard-capped at the most recent 720 candles / ~30 days regardless of
+    what you ask for), Coinbase supports real pagination arbitrarily far
+    back in time via start/end params. Max 300 candles per call, so we
+    page through in ~12.5-day chunks.
     """
-    pair = KRAKEN_PAIRS.get(symbol, "XBTUSD")
-    start_s = start_ms // 1000
-    end_s = end_ms // 1000
+    product_id = COINBASE_PRODUCTS.get(symbol, "BTC-USD")
+    url = COINBASE_CANDLES_URL.format(product_id=product_id)
+
+    start_dt = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
+    end_dt = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc)
+
+    chunk_span = timedelta(seconds=GRANULARITY_SECONDS * COINBASE_MAX_CANDLES_PER_CALL)
 
     all_rows = []
-    since = start_s
-    result_key = None
-
-    while since < end_s:
-        params = {"pair": pair, "interval": 60, "since": since}
-        resp = requests.get(KRAKEN_OHLC_URL, params=params, timeout=15)
+    chunk_start = start_dt
+    while chunk_start < end_dt:
+        chunk_end = min(chunk_start + chunk_span, end_dt)
+        params = {
+            "start": chunk_start.isoformat(),
+            "end": chunk_end.isoformat(),
+            "granularity": GRANULARITY_SECONDS,
+        }
+        resp = requests.get(url, params=params, timeout=15)
+        if resp.status_code == 429:
+            time.sleep(1.0)
+            resp = requests.get(url, params=params, timeout=15)
         resp.raise_for_status()
-        payload = resp.json()
-        if payload.get("error"):
-            raise RuntimeError("; ".join(payload["error"]))
-
-        result = payload["result"]
-        if result_key is None:
-            result_key = next(k for k in result.keys() if k != "last")
-        rows = result.get(result_key, [])
-        if not rows:
-            break
-
+        rows = resp.json()  # each row: [time, low, high, open, close, volume]
+        if isinstance(rows, dict):
+            raise RuntimeError(rows.get("message", "Coinbase API error"))
         all_rows.extend(rows)
-        last_ts = int(payload["result"]["last"])
-        if last_ts <= since:
-            break
-        since = last_ts
-        time.sleep(0.15)  # be polite to the API
+
+        chunk_start = chunk_end
+        time.sleep(0.35)  # Coinbase public rate limit is ~3 req/sec
 
     if not all_rows:
         return pd.DataFrame(columns=["open_time", "open", "high", "low", "close", "volume"])
 
-    df = pd.DataFrame(
-        all_rows,
-        columns=["time", "open", "high", "low", "close", "vwap", "volume", "count"],
-    )
+    df = pd.DataFrame(all_rows, columns=["time", "low", "high", "open", "close", "volume"])
     df = df.drop_duplicates(subset="time").sort_values("time")
     df["open_time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-    df = df[
-        (df["open_time"] >= pd.to_datetime(start_ms, unit="ms", utc=True))
-        & (df["open_time"] <= pd.to_datetime(end_ms, unit="ms", utc=True))
-    ]
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = df[col].astype(float)
     return df[["open_time", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
@@ -101,24 +99,61 @@ def build_view(df: pd.DataFrame, tz_name: str) -> pd.DataFrame:
 
 st.title("₿ BTC Hourly Range Explorer")
 st.caption(
-    "Live hourly candles from Binance (BTCUSDT spot). Pick a window and "
+    "Live hourly candles from Coinbase (BTC/USD spot). Pick a window and "
     "timezone to see which hours of the day tend to move the most / least."
 )
 
 with st.sidebar:
     st.header("Settings")
-    lookback_days = st.slider("Lookback window (days)", 7, 180, 90, step=1)
+    lookback_mode = st.radio("Time window", ["Quick preset", "Custom date range"], index=0)
+
+    if lookback_mode == "Quick preset":
+        preset = st.select_slider(
+            "Lookback",
+            options=["1 week", "2 weeks", "1 month", "3 months", "6 months", "1 year"],
+            value="6 months",
+        )
+        preset_days = {
+            "1 week": 7, "2 weeks": 14, "1 month": 30,
+            "3 months": 90, "6 months": 180, "1 year": 365,
+        }
+        lookback_days = preset_days[preset]
+        custom_start = None
+        custom_end = None
+    else:
+        today = datetime.now(timezone.utc).date()
+        default_start = today - timedelta(days=180)
+        date_range = st.date_input(
+            "Select start and end date",
+            value=(default_start, today),
+            min_value=today - timedelta(days=365 * 3),
+            max_value=today,
+        )
+        if isinstance(date_range, tuple) and len(date_range) == 2:
+            custom_start, custom_end = date_range
+        else:
+            custom_start, custom_end = default_start, today
+        lookback_days = (custom_end - custom_start).days
+        if lookback_days < 1:
+            st.warning("End date must be after start date. Using last 7 days instead.")
+            custom_start, custom_end = today - timedelta(days=7), today
+            lookback_days = 7
     tz_label = st.selectbox("Display timezone", list(TIMEZONES.keys()), index=1)
     tz_name = TIMEZONES[tz_label]
     symbol_label = st.selectbox("Symbol", ["BTC/USD", "ETH/USD"], index=0)
     symbol = "BTCUSDT" if symbol_label == "BTC/USD" else "ETHUSDT"
     st.caption(
-        "Data source: Kraken public API "
-        "(`/0/public/OHLC`), no key required."
+        "Data source: Coinbase Exchange public API "
+        "(`/products/{id}/candles`), no key required."
     )
 
-end_dt = datetime.now(timezone.utc)
-start_dt = end_dt - timedelta(days=lookback_days)
+if lookback_mode == "Custom date range" and custom_start is not None:
+    start_dt = datetime.combine(custom_start, datetime.min.time(), tzinfo=timezone.utc)
+    end_dt = datetime.combine(custom_end, datetime.min.time(), tzinfo=timezone.utc) + timedelta(days=1)
+    end_dt = min(end_dt, datetime.now(timezone.utc))
+else:
+    end_dt = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(days=lookback_days)
 start_ms = int(start_dt.timestamp() * 1000)
 end_ms = int(end_dt.timestamp() * 1000)
 
@@ -178,11 +213,75 @@ st.divider()
 st.subheader(f"Range by hour of day ({tz_label})")
 
 hourly = (
-    df.groupby("hour")["range"]
-    .agg(max_range="max", mean_range="mean", median_range="median", count="count")
+    df.groupby("hour")
+    .agg(
+        max_range=("range", "max"),
+        mean_range=("range", "mean"),
+        median_range=("range", "median"),
+        std_range=("range", "std"),
+        mean_volume=("volume", "mean"),
+        count=("range", "count"),
+    )
     .reindex(range(24))
     .reset_index()
 )
+
+st.divider()
+
+# ---- Recommended calm trading hours ----
+st.subheader(f"🎯 Recommended calm hours to trade ({tz_label})")
+st.caption(
+    "Ranked from the data you selected above. This reflects **what already "
+    "happened historically** in this window — it is not a prediction, and "
+    "it isn't financial advice. Quiet hours can still spike on news, and "
+    "hours with unusually low volume can mean wider spreads even when the "
+    "candle range looks small, so this ranking also flags thin-liquidity hours."
+)
+
+liquidity_threshold = hourly["mean_volume"].quantile(0.25)
+hourly["thin_liquidity"] = hourly["mean_volume"] < liquidity_threshold
+
+# Calmness score: primarily average range, with a penalty for inconsistency
+# (a hour that's usually calm but occasionally spikes hard is riskier than
+# one that's consistently calm), normalized 0-100 (lower = calmer).
+range_norm = (hourly["mean_range"] - hourly["mean_range"].min()) / (
+    hourly["mean_range"].max() - hourly["mean_range"].min() + 1e-9
+)
+std_norm = (hourly["std_range"] - hourly["std_range"].min()) / (
+    hourly["std_range"].max() - hourly["std_range"].min() + 1e-9
+)
+hourly["calm_score"] = (0.7 * range_norm + 0.3 * std_norm) * 100
+
+ranked = hourly.sort_values("calm_score").reset_index(drop=True)
+top_calm = ranked[~ranked["thin_liquidity"]].head(5)
+if len(top_calm) < 3:
+    top_calm = ranked.head(5)  # fall back if too many hours got flagged thin
+
+display_cols = pd.DataFrame({
+    "Hour": top_calm["hour"].apply(lambda h: f"{int(h):02d}:00"),
+    "Avg range": top_calm["mean_range"].apply(lambda v: f"${v:,.0f}"),
+    "Max range seen": top_calm["max_range"].apply(lambda v: f"${v:,.0f}"),
+    "Consistency (std dev)": top_calm["std_range"].apply(lambda v: f"±${v:,.0f}"),
+    "Sample size": top_calm["count"].apply(lambda v: f"{int(v)} candles"),
+})
+st.table(display_cols)
+
+thin_hours = ranked[ranked["thin_liquidity"] & (ranked["hour"].isin(ranked.head(8)["hour"]))]
+if not thin_hours.empty:
+    thin_list = ", ".join(f"{int(h):02d}:00" for h in thin_hours["hour"])
+    st.warning(
+        f"⚠️ Hours excluded from the table despite low range, due to unusually "
+        f"low volume (bottom 25% of the day) — spreads/slippage risk: **{thin_list}**"
+    )
+
+worst = ranked.tail(3).sort_values("calm_score", ascending=False)
+worst_list = ", ".join(f"{int(h):02d}:00" for h in worst["hour"])
+st.error(f"🔥 Historically most volatile hours in this window — avoid if you want calm conditions: **{worst_list}**")
+
+st.divider()
+
+# ---- Per-hour-of-day summary ----
+st.subheader(f"Range by hour of day ({tz_label})")
 
 fig_max = px.bar(
     hourly,
@@ -198,23 +297,17 @@ fig_mean = px.bar(
     hourly,
     x="hour",
     y="mean_range",
-    labels={"hour": f"Hour of day ({tz_label})", "mean_range": "Average range (USD)"},
+    color="thin_liquidity",
+    color_discrete_map={True: "#d3a625", False: "#1f77b4"},
+    labels={
+        "hour": f"Hour of day ({tz_label})",
+        "mean_range": "Average range (USD)",
+        "thin_liquidity": "Low volume (bottom 25%)",
+    },
     title="Average hourly range, by hour of day (typical movement)",
 )
 fig_mean.update_layout(xaxis=dict(tickmode="linear", dtick=1))
 st.plotly_chart(fig_mean, use_container_width=True)
-
-quietest = hourly.loc[hourly["mean_range"].idxmin()]
-busiest = hourly.loc[hourly["mean_range"].idxmax()]
-q1, q2 = st.columns(2)
-q1.info(
-    f"**Quietest hour on average:** {int(quietest['hour']):02d}:00 {tz_label} "
-    f"— avg range ${quietest['mean_range']:,.0f}"
-)
-q2.warning(
-    f"**Busiest hour on average:** {int(busiest['hour']):02d}:00 {tz_label} "
-    f"— avg range ${busiest['mean_range']:,.0f}"
-)
 
 st.divider()
 
@@ -267,7 +360,7 @@ st.download_button(
 )
 
 st.caption(
-    "Data refreshes from Kraken every time you change a setting (cached for 30 min). "
-    "This is Kraken's own spot market data — actual ranges can differ slightly "
-    "from other exchanges like Binance."
+    "Data refreshes from Coinbase every time you change a setting (cached for 30 min). "
+    "This is Coinbase's own spot market data — actual ranges can differ slightly "
+    "from other exchanges like Binance or Kraken."
 )
