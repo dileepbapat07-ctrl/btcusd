@@ -20,12 +20,7 @@ from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="BTC Hourly Range Explorer", layout="wide")
 
-BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
-COLUMNS = [
-    "open_time", "open", "high", "low", "close", "volume",
-    "close_time", "quote_volume", "trades",
-    "taker_buy_base", "taker_buy_quote", "ignore",
-]
+CRYPTOCOMPARE_URL = "https://min-api.cryptocompare.com/data/v2/histohour"
 
 TIMEZONES = {
     "UTC": "UTC",
@@ -41,40 +36,59 @@ BUCKET_LABELS = ["0-100", "100-200", "200-300", "300-400", "400-500", "500+"]
 
 @st.cache_data(ttl=60 * 30, show_spinner=False)
 def fetch_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
-    """Pull klines from Binance in pages of 1000 (Binance's per-request cap)."""
+    """
+    Pull hourly OHLC from CryptoCompare's public histohour endpoint.
+    Not geo-restricted (unlike Binance's API, which returns 451 on US-hosted
+    servers such as Streamlit Community Cloud's default region).
+    Paginates backwards in pages of up to 2000 hours.
+    """
+    fsym = symbol.replace("USDT", "").replace("USD", "")
+    tsym = "USD"
+
+    end_s = end_ms // 1000
+    start_s = start_ms // 1000
+    total_hours_needed = max(1, (end_s - start_s) // 3600)
+
     all_rows = []
-    cursor = start_ms
-    while cursor < end_ms:
+    to_ts = end_s
+    remaining = total_hours_needed
+
+    while remaining > 0 and to_ts > start_s:
+        page_limit = min(2000, remaining)
         params = {
-            "symbol": symbol,
-            "interval": interval,
-            "startTime": cursor,
-            "endTime": end_ms,
-            "limit": 1000,
+            "fsym": fsym,
+            "tsym": tsym,
+            "limit": page_limit,
+            "toTs": to_ts,
         }
-        resp = requests.get(BINANCE_KLINES_URL, params=params, timeout=15)
+        resp = requests.get(CRYPTOCOMPARE_URL, params=params, timeout=15)
         resp.raise_for_status()
-        rows = resp.json()
+        payload = resp.json()
+        if payload.get("Response") != "Success":
+            raise RuntimeError(payload.get("Message", "CryptoCompare API error"))
+
+        rows = payload["Data"]["Data"]
         if not rows:
             break
+
         all_rows.extend(rows)
-        last_open_time = rows[-1][0]
-        next_cursor = last_open_time + 1
-        if next_cursor <= cursor:
+        earliest_time = rows[0]["time"]
+        if earliest_time <= start_s:
             break
-        cursor = next_cursor
-        if len(rows) < 1000:
-            break
-        time.sleep(0.2)  # be polite to the API
+        to_ts = earliest_time - 1
+        remaining -= len(rows)
+        time.sleep(0.15)  # be polite to the API
 
     if not all_rows:
-        return pd.DataFrame(columns=COLUMNS)
+        return pd.DataFrame(columns=["open_time", "open", "high", "low", "close", "volume"])
 
-    df = pd.DataFrame(all_rows, columns=COLUMNS)
+    df = pd.DataFrame(all_rows).drop_duplicates(subset="time").sort_values("time")
+    df = df.rename(columns={"time": "open_time", "volumeto": "volume"})
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="s", utc=True)
+    df = df[df["open_time"] >= pd.to_datetime(start_ms, unit="ms", utc=True)]
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = df[col].astype(float)
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    return df
+    return df[["open_time", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
 
 
 def build_view(df: pd.DataFrame, tz_name: str) -> pd.DataFrame:
@@ -99,8 +113,8 @@ with st.sidebar:
     tz_name = TIMEZONES[tz_label]
     symbol = st.selectbox("Symbol", ["BTCUSDT", "ETHUSDT"], index=0)
     st.caption(
-        "Data source: Binance public REST API "
-        "(`/api/v3/klines`), no key required."
+        "Data source: CryptoCompare public API "
+        "(`histohour`), no key required."
     )
 
 end_dt = datetime.now(timezone.utc)
@@ -112,7 +126,7 @@ with st.spinner(f"Fetching {lookback_days} days of hourly {symbol} candles..."):
     try:
         raw = fetch_klines(symbol, "1h", start_ms, end_ms)
     except Exception as e:
-        st.error(f"Couldn't reach Binance API: {e}")
+        st.error(f"Couldn't reach the data API: {e}")
         st.stop()
 
 if raw.empty:
@@ -229,6 +243,7 @@ st.download_button(
 )
 
 st.caption(
-    "Data refreshes from Binance every time you change a setting (cached for 30 min). "
-    "This is spot market data — actual ranges can differ slightly across exchanges."
+    "Data refreshes from CryptoCompare every time you change a setting (cached for 30 min). "
+    "This is an aggregated cross-exchange price — actual ranges can differ slightly "
+    "from any single exchange like Binance."
 )
