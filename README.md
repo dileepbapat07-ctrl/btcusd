@@ -1,8 +1,13 @@
 # BTC Hourly Range Explorer
 
-An interactive Streamlit app that pulls live hourly BTCUSDT candles from
-Binance's public API and shows, by hour of day, how big the typical / max
+An interactive Streamlit app that pulls live hourly BTC/USD candles from
+CryptoCompare's public API and shows, by hour of day, how big the typical / max
 price range is — plus a 100/200/300/400/500-point bucket breakdown.
+
+> **Note:** an earlier version used Binance's API directly, but Binance
+> returns HTTP 451 (geo-blocked) for US-hosted servers — including Streamlit
+> Community Cloud's default region. CryptoCompare aggregates price data
+> across exchanges and isn't subject to that block.
 
 ## Run it locally
 
@@ -38,10 +43,10 @@ and re-caches data (30 min cache) each time you change a setting.
 
 ## Notes
 
-- Data comes directly from `https://api.binance.com/api/v3/klines` —
-  spot market, `1h` interval.
-- If Binance's API is geo-blocked from wherever you deploy (rare, but
-  happens for some cloud regions), you'd see a fetch error — Streamlit
-  Community Cloud's default region hasn't had issues with this in
-  practice.
+- Data comes from `https://min-api.cryptocompare.com/data/v2/histohour` —
+  an aggregated BTC/USD price across major exchanges, `1h` interval, no
+  API key required for this usage level.
 - Ranges are `high - low` per hourly candle, in raw USD points (not %).
+- Because this is an aggregated/index price rather than a single exchange's
+  order book, exact numbers may differ slightly from Binance-specific data,
+  but the hour-of-day patterns (quiet vs. busy hours) will be consistent.
