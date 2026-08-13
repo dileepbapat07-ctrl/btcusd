@@ -231,11 +231,10 @@ st.divider()
 # ---- Recommended calm trading hours ----
 st.subheader(f"🎯 Recommended calm hours to trade ({tz_label})")
 st.caption(
-    "Ranked from the data you selected above. This reflects **what already "
-    "happened historically** in this window — it is not a prediction, and "
-    "it isn't financial advice. Quiet hours can still spike on news, and "
-    "hours with unusually low volume can mean wider spreads even when the "
-    "candle range looks small, so this ranking also flags thin-liquidity hours."
+    "Ranked from the data you selected above, purely by how calm each hour's "
+    "price range historically was. This reflects **what already happened "
+    "historically** in this window — it is not a prediction, and it isn't "
+    "financial advice. Quiet hours can still spike on news."
 )
 
 liquidity_threshold = hourly["mean_volume"].quantile(0.25)
@@ -253,25 +252,26 @@ std_norm = (hourly["std_range"] - hourly["std_range"].min()) / (
 hourly["calm_score"] = (0.7 * range_norm + 0.3 * std_norm) * 100
 
 ranked = hourly.sort_values("calm_score").reset_index(drop=True)
-top_calm = ranked[~ranked["thin_liquidity"]].head(5)
-if len(top_calm) < 3:
-    top_calm = ranked.head(5)  # fall back if too many hours got flagged thin
+top_calm = ranked.head(5)
 
 display_cols = pd.DataFrame({
     "Hour": top_calm["hour"].apply(lambda h: f"{int(h):02d}:00"),
     "Avg range": top_calm["mean_range"].apply(lambda v: f"${v:,.0f}"),
     "Max range seen": top_calm["max_range"].apply(lambda v: f"${v:,.0f}"),
     "Consistency (std dev)": top_calm["std_range"].apply(lambda v: f"±${v:,.0f}"),
+    "Avg volume": top_calm["mean_volume"].apply(lambda v: f"{v:,.1f}"),
     "Sample size": top_calm["count"].apply(lambda v: f"{int(v)} candles"),
 })
 st.table(display_cols)
 
-thin_hours = ranked[ranked["thin_liquidity"] & (ranked["hour"].isin(ranked.head(8)["hour"]))]
-if not thin_hours.empty:
-    thin_list = ", ".join(f"{int(h):02d}:00" for h in thin_hours["hour"])
-    st.warning(
-        f"⚠️ Hours excluded from the table despite low range, due to unusually "
-        f"low volume (bottom 25% of the day) — spreads/slippage risk: **{thin_list}**"
+low_vol_in_top = top_calm[top_calm["thin_liquidity"]]
+if not low_vol_in_top.empty:
+    low_vol_list = ", ".join(f"{int(h):02d}:00" for h in low_vol_in_top["hour"])
+    st.caption(
+        f"ℹ️ Note: {low_vol_list} also had below-average volume in this window "
+        f"(bottom 25% of the day) — range was still genuinely low, but thinner "
+        f"volume can sometimes mean wider spreads. Included here since you "
+        f"asked not to filter on this."
     )
 
 worst = ranked.tail(3).sort_values("calm_score", ascending=False)
