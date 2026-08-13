@@ -20,7 +20,8 @@ from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="BTC Hourly Range Explorer", layout="wide")
 
-CRYPTOCOMPARE_URL = "https://min-api.cryptocompare.com/data/v2/histohour"
+KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC"
+KRAKEN_PAIRS = {"BTCUSDT": "XBTUSD", "ETHUSDT": "ETHUSD"}
 
 TIMEZONES = {
     "UTC": "UTC",
@@ -37,55 +38,53 @@ BUCKET_LABELS = ["0-100", "100-200", "200-300", "300-400", "400-500", "500+"]
 @st.cache_data(ttl=60 * 30, show_spinner=False)
 def fetch_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
     """
-    Pull hourly OHLC from CryptoCompare's public histohour endpoint.
-    Not geo-restricted (unlike Binance's API, which returns 451 on US-hosted
-    servers such as Streamlit Community Cloud's default region).
-    Paginates backwards in pages of up to 2000 hours.
+    Pull hourly OHLC from Kraken's public API (no key required, not
+    geo-blocked). Kraken returns at most 720 candles per call, so we page
+    forward using the 'since' cursor until we reach the end of the window.
     """
-    fsym = symbol.replace("USDT", "").replace("USD", "")
-    tsym = "USD"
-
-    end_s = end_ms // 1000
+    pair = KRAKEN_PAIRS.get(symbol, "XBTUSD")
     start_s = start_ms // 1000
-    total_hours_needed = max(1, (end_s - start_s) // 3600)
+    end_s = end_ms // 1000
 
     all_rows = []
-    to_ts = end_s
-    remaining = total_hours_needed
+    since = start_s
+    result_key = None
 
-    while remaining > 0 and to_ts > start_s:
-        page_limit = min(2000, remaining)
-        params = {
-            "fsym": fsym,
-            "tsym": tsym,
-            "limit": page_limit,
-            "toTs": to_ts,
-        }
-        resp = requests.get(CRYPTOCOMPARE_URL, params=params, timeout=15)
+    while since < end_s:
+        params = {"pair": pair, "interval": 60, "since": since}
+        resp = requests.get(KRAKEN_OHLC_URL, params=params, timeout=15)
         resp.raise_for_status()
         payload = resp.json()
-        if payload.get("Response") != "Success":
-            raise RuntimeError(payload.get("Message", "CryptoCompare API error"))
+        if payload.get("error"):
+            raise RuntimeError("; ".join(payload["error"]))
 
-        rows = payload["Data"]["Data"]
+        result = payload["result"]
+        if result_key is None:
+            result_key = next(k for k in result.keys() if k != "last")
+        rows = result.get(result_key, [])
         if not rows:
             break
 
         all_rows.extend(rows)
-        earliest_time = rows[0]["time"]
-        if earliest_time <= start_s:
+        last_ts = int(payload["result"]["last"])
+        if last_ts <= since:
             break
-        to_ts = earliest_time - 1
-        remaining -= len(rows)
+        since = last_ts
         time.sleep(0.15)  # be polite to the API
 
     if not all_rows:
         return pd.DataFrame(columns=["open_time", "open", "high", "low", "close", "volume"])
 
-    df = pd.DataFrame(all_rows).drop_duplicates(subset="time").sort_values("time")
-    df = df.rename(columns={"time": "open_time", "volumeto": "volume"})
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="s", utc=True)
-    df = df[df["open_time"] >= pd.to_datetime(start_ms, unit="ms", utc=True)]
+    df = pd.DataFrame(
+        all_rows,
+        columns=["time", "open", "high", "low", "close", "vwap", "volume", "count"],
+    )
+    df = df.drop_duplicates(subset="time").sort_values("time")
+    df["open_time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    df = df[
+        (df["open_time"] >= pd.to_datetime(start_ms, unit="ms", utc=True))
+        & (df["open_time"] <= pd.to_datetime(end_ms, unit="ms", utc=True))
+    ]
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = df[col].astype(float)
     return df[["open_time", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
@@ -111,10 +110,11 @@ with st.sidebar:
     lookback_days = st.slider("Lookback window (days)", 7, 180, 90, step=1)
     tz_label = st.selectbox("Display timezone", list(TIMEZONES.keys()), index=1)
     tz_name = TIMEZONES[tz_label]
-    symbol = st.selectbox("Symbol", ["BTCUSDT", "ETHUSDT"], index=0)
+    symbol_label = st.selectbox("Symbol", ["BTC/USD", "ETH/USD"], index=0)
+    symbol = "BTCUSDT" if symbol_label == "BTC/USD" else "ETHUSDT"
     st.caption(
-        "Data source: CryptoCompare public API "
-        "(`histohour`), no key required."
+        "Data source: Kraken public API "
+        "(`/0/public/OHLC`), no key required."
     )
 
 end_dt = datetime.now(timezone.utc)
@@ -243,7 +243,7 @@ st.download_button(
 )
 
 st.caption(
-    "Data refreshes from CryptoCompare every time you change a setting (cached for 30 min). "
-    "This is an aggregated cross-exchange price — actual ranges can differ slightly "
-    "from any single exchange like Binance."
+    "Data refreshes from Kraken every time you change a setting (cached for 30 min). "
+    "This is Kraken's own spot market data — actual ranges can differ slightly "
+    "from other exchanges like Binance."
 )
