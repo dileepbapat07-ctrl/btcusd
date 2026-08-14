@@ -1,8 +1,9 @@
 """
-BTC Hourly Range Explorer
---------------------------
-Pulls hourly BTCUSDT candles from Binance's public REST API and shows,
-per hour-of-day, how big the typical / max candle range is.
+Crypto Hourly Range Explorer
+-----------------------------
+Pulls hourly OHLC candles (BTC, ETH, and easy to extend to more) from
+Coinbase's public REST API and shows, per hour-of-day, how big the
+typical / max candle range is, plus which hours are historically calmest.
 
 Runs on Streamlit Community Cloud (streamlit.app) or locally with:
     pip install -r requirements.txt
@@ -18,10 +19,16 @@ import requests
 import streamlit as st
 from zoneinfo import ZoneInfo
 
-st.set_page_config(page_title="BTC Hourly Range Explorer", layout="wide")
+st.set_page_config(page_title="Crypto Hourly Range Explorer", layout="wide")
+
+# ---- Coin registry: add more coins here as needed ----
+COINS = {
+    "BTC/USD": {"coinbase_id": "BTC-USD", "short": "BTC", "emoji": "₿"},
+    "ETH/USD": {"coinbase_id": "ETH-USD", "short": "ETH", "emoji": "Ξ"},
+}
+DEFAULT_COIN = "BTC/USD"
 
 COINBASE_CANDLES_URL = "https://api.exchange.coinbase.com/products/{product_id}/candles"
-COINBASE_PRODUCTS = {"BTCUSDT": "BTC-USD", "ETHUSDT": "ETH-USD"}
 COINBASE_MAX_CANDLES_PER_CALL = 300  # Coinbase's hard cap per request
 GRANULARITY_SECONDS = 3600  # 1 hour
 
@@ -38,7 +45,7 @@ BUCKET_LABELS = ["0-100", "100-200", "200-300", "300-400", "400-500", "500+"]
 
 
 @st.cache_data(ttl=60 * 30, show_spinner=False)
-def fetch_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+def fetch_klines(product_id: str, start_ms: int, end_ms: int) -> pd.DataFrame:
     """
     Pull hourly OHLC from Coinbase Exchange's public candles endpoint.
     No key required, not geo-blocked, and unlike Kraken's OHLC endpoint
@@ -47,7 +54,6 @@ def fetch_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.D
     back in time via start/end params. Max 300 candles per call, so we
     page through in ~12.5-day chunks.
     """
-    product_id = COINBASE_PRODUCTS.get(symbol, "BTC-USD")
     url = COINBASE_CANDLES_URL.format(product_id=product_id)
 
     start_dt = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
@@ -97,14 +103,18 @@ def build_view(df: pd.DataFrame, tz_name: str) -> pd.DataFrame:
     return out
 
 
-st.title("₿ BTC Hourly Range Explorer")
+st.title("🪙 Crypto Hourly Range Explorer")
 st.caption(
-    "Live hourly candles from Coinbase (BTC/USD spot). Pick a window and "
+    "Live hourly candles from Coinbase. Pick a coin, a window, and a "
     "timezone to see which hours of the day tend to move the most / least."
 )
 
 with st.sidebar:
     st.header("Settings")
+    coin_label = st.selectbox("Coin", list(COINS.keys()), index=list(COINS.keys()).index(DEFAULT_COIN))
+    coin = COINS[coin_label]
+    product_id = coin["coinbase_id"]
+
     lookback_mode = st.radio("Time window", ["Quick preset", "Custom date range"], index=0)
 
     if lookback_mode == "Quick preset":
@@ -140,8 +150,6 @@ with st.sidebar:
             lookback_days = 7
     tz_label = st.selectbox("Display timezone", list(TIMEZONES.keys()), index=1)
     tz_name = TIMEZONES[tz_label]
-    symbol_label = st.selectbox("Symbol", ["BTC/USD", "ETH/USD"], index=0)
-    symbol = "BTCUSDT" if symbol_label == "BTC/USD" else "ETHUSDT"
     st.caption(
         "Data source: Coinbase Exchange public API "
         "(`/products/{id}/candles`), no key required."
@@ -157,9 +165,11 @@ else:
 start_ms = int(start_dt.timestamp() * 1000)
 end_ms = int(end_dt.timestamp() * 1000)
 
-with st.spinner(f"Fetching {lookback_days} days of hourly {symbol} candles..."):
+st.header(f"{coin['emoji']} {coin['short']}/USD")
+
+with st.spinner(f"Fetching {lookback_days} days of hourly {coin['short']} candles..."):
     try:
-        raw = fetch_klines(symbol, "1h", start_ms, end_ms)
+        raw = fetch_klines(product_id, start_ms, end_ms)
     except Exception as e:
         st.error(f"Couldn't reach the data API: {e}")
         st.stop()
@@ -440,7 +450,7 @@ csv = df[show_cols].to_csv(index=False).encode("utf-8")
 st.download_button(
     "Download this data as CSV",
     data=csv,
-    file_name=f"{symbol}_hourly_range_{lookback_days}d.csv",
+    file_name=f"{coin['short']}_hourly_range_{lookback_days}d.csv",
     mime="text/csv",
 )
 
