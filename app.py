@@ -256,6 +256,99 @@ c4.metric("Mean hourly range", fmt(df["display_range"].mean()))
 
 st.divider()
 
+# ---- Volatility regime detection ----
+st.subheader("📉 Volatility regime check")
+st.caption(
+    "Everything above averages your whole selected window together — but "
+    "volatility isn't constant over time, it moves in stretches ('regimes'). "
+    "This shows whether the market has recently been calmer or more volatile "
+    "than its own historical average, so you know if the hour-of-day patterns "
+    "above still reflect current conditions."
+)
+
+daily = (
+    df.groupby(df["local_time"].dt.date)["display_range"]
+    .mean()
+    .rename("daily_avg")
+    .reset_index()
+    .rename(columns={"local_time": "date"})
+    .sort_values("date")
+)
+daily["date"] = pd.to_datetime(daily["date"])
+daily["roll7"] = daily["daily_avg"].rolling(7, min_periods=3).mean()
+daily["roll30"] = daily["daily_avg"].rolling(30, min_periods=10).mean()
+
+whole_median = df["display_range"].median()
+whole_mean = df["display_range"].mean()
+
+n_days = len(daily)
+if n_days >= 3:
+    recent_n = min(7, n_days)
+    recent_avg = daily["daily_avg"].tail(recent_n).mean()
+    ratio = recent_avg / whole_mean if whole_mean else 1.0
+
+    if ratio >= 1.3:
+        regime_label, regime_color = "🔥 Elevated — running hotter than usual", "error"
+    elif ratio <= 0.7:
+        regime_label, regime_color = "😴 Below normal — unusually calm right now", "success"
+    else:
+        regime_label, regime_color = "✅ Normal — in line with historical average", "info"
+
+    rc1, rc2, rc3 = st.columns(3)
+    rc1.metric(f"Last {recent_n}-day avg range", fmt(recent_avg))
+    rc2.metric("Whole-window avg range", fmt(whole_mean))
+    rc3.metric("Ratio (recent / whole-window)", f"{ratio:.2f}x")
+    getattr(st, regime_color)(f"**Current regime: {regime_label}**")
+else:
+    st.info("Select a longer window (at least a few days) to check the current regime.")
+
+fig_regime = px.line(
+    daily,
+    x="date",
+    y=["daily_avg", "roll7", "roll30"],
+    labels={"date": "Date", "value": f"Avg daily range ({unit})", "variable": "Series"},
+)
+fig_regime.data[0].update(name="Daily avg", opacity=0.35)
+fig_regime.data[1].update(name="7-day rolling avg", line=dict(width=2.5))
+fig_regime.data[2].update(name="30-day rolling avg", line=dict(width=2.5, dash="dash"))
+fig_regime.add_hline(
+    y=whole_median, line_dash="dot", line_color="gray",
+    annotation_text="Whole-window median", annotation_position="bottom right",
+)
+if unit == "%":
+    fig_regime.update_layout(yaxis=dict(ticksuffix="%"))
+fig_regime.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02))
+st.plotly_chart(fig_regime, use_container_width=True)
+
+# Flag statistically anomalous days vs a trailing 30-day baseline (regime-shift candidates)
+if n_days >= 20:
+    baseline_mean = daily["daily_avg"].rolling(30, min_periods=10).mean()
+    baseline_std = daily["daily_avg"].rolling(30, min_periods=10).std()
+    daily["zscore"] = (daily["daily_avg"] - baseline_mean) / baseline_std
+    spikes = daily[daily["zscore"].abs() >= 2].dropna(subset=["zscore"])
+    if not spikes.empty:
+        spike_list = ", ".join(
+            f"{d.strftime('%Y-%m-%d')} ({z:+.1f}σ)"
+            for d, z in zip(spikes["date"], spikes["zscore"])
+        )
+        st.warning(
+            f"⚠️ Days that stood out sharply (≥2 standard deviations) from their "
+            f"trailing 30-day baseline — possible regime-shift points worth "
+            f"looking into: **{spike_list}**"
+        )
+    else:
+        st.caption("No sharp (≥2σ) daily outliers detected vs trailing 30-day baseline in this window.")
+
+st.caption(
+    "This is descriptive, not predictive — it tells you where volatility has "
+    "been, not where it's going next. If the recent ratio is well above or "
+    "below 1.0x, treat the hour-of-day win rates above with extra caution: "
+    "they're calculated from the *whole* window, which may include a "
+    "different regime than right now."
+)
+
+st.divider()
+
 # ---- Per-hour-of-day summary ----
 hourly = (
     df.groupby("hour")
@@ -416,6 +509,83 @@ with st.expander("See exact percentages as a table"):
 worst = ranked.tail(3).sort_values("calm_score", ascending=False)
 worst_list = ", ".join(f"{int(h):02d}:00" for h in worst["hour"])
 st.error(f"🔥 Historically most volatile hours in this window — avoid if you want calm conditions: **{worst_list}**")
+
+st.divider()
+
+# ---- Target range "win rate" (e.g. for Kalshi-style range prediction) ----
+st.subheader(f"🎯 Historical win rate for a target range ({unit})")
+st.caption(
+    "For range-prediction markets (e.g. Kalshi-style 'will the range stay "
+    "under X') this shows how often each hour's *actual* historical range "
+    "landed inside a band you choose. This is a **base rate from the past**, "
+    "not a guaranteed future probability — market makers price these "
+    "contracts using their own models, current volatility can differ from "
+    "this window's average, and the exact settlement window/reference price "
+    "a contract uses may not exactly match this hourly candle definition."
+)
+
+if unit == "%":
+    wr_lo, wr_hi = st.slider(
+        "Target range band (won if actual range falls inside this band)",
+        min_value=0.0, max_value=2.0, value=(0.0, 0.4), step=0.05, format="%.2f%%",
+    )
+else:
+    wr_lo, wr_hi = st.slider(
+        "Target range band ($, won if actual range falls inside this band)",
+        min_value=0, max_value=2000, value=(0, 300), step=10,
+    )
+
+hit = df.groupby("hour")["display_range"].apply(lambda s: ((s >= wr_lo) & (s <= wr_hi)).mean() * 100)
+n_obs = df.groupby("hour")["display_range"].count()
+hit_df = pd.DataFrame({"hour": range(24)}).merge(
+    hit.rename("win_rate").reset_index(), on="hour", how="left"
+).merge(n_obs.rename("n").reset_index(), on="hour", how="left").fillna(0)
+
+# Wilson 95% confidence interval — accounts for sample size, so a 90%
+# win rate on 10 candles doesn't look as trustworthy as 90% on 500 candles.
+z = 1.96
+p = hit_df["win_rate"] / 100
+n = hit_df["n"].replace(0, pd.NA)
+denom = 1 + z**2 / n
+center = p + z**2 / (2 * n)
+adj = z * ((p * (1 - p) + z**2 / (4 * n)) / n) ** 0.5
+hit_df["ci_low"] = ((center - adj) / denom * 100).fillna(0)
+hit_df["ci_high"] = ((center + adj) / denom * 100).fillna(0)
+
+hit_sorted = hit_df.sort_values("win_rate", ascending=False)
+
+fig_hit = px.bar(
+    hit_sorted,
+    x=hit_sorted["hour"].apply(lambda h: f"{int(h):02d}:00"),
+    y="win_rate",
+    error_y=hit_sorted["ci_high"] - hit_sorted["win_rate"],
+    error_y_minus=hit_sorted["win_rate"] - hit_sorted["ci_low"],
+    labels={"x": f"Hour of day ({tz_label})", "win_rate": "Historical win rate"},
+    title=f"How often the range stayed within [{wr_lo}, {wr_hi}]{unit}, by hour",
+)
+fig_hit.update_layout(yaxis=dict(ticksuffix="%", range=[0, 100]))
+st.plotly_chart(fig_hit, use_container_width=True)
+
+best5 = hit_sorted.head(5)
+win_table = pd.DataFrame({
+    "Hour": best5["hour"].apply(lambda h: f"{int(h):02d}:00"),
+    "Win rate": best5["win_rate"].apply(lambda v: f"{v:.1f}%"),
+    "95% confidence range": best5.apply(lambda r: f"{r['ci_low']:.1f}% – {r['ci_high']:.1f}%", axis=1),
+    "Sample size": best5["n"].apply(lambda v: f"{int(v)} candles"),
+})
+st.table(win_table.set_index("Hour"))
+st.caption(
+    "**How to read the confidence range:** a narrow gap (e.g. 78%–85%) means "
+    "the win rate is well-supported by enough data to trust it. A wide gap "
+    "(e.g. 60%–95%) means the sample size is too small to be confident — the "
+    "true rate could be much lower than the headline number shows. As a "
+    "rule of thumb, treat anything under ~50 candles with real caution."
+)
+
+thin_sample = hit_df[hit_df["n"] < 30]
+if not thin_sample.empty:
+    thin_list = ", ".join(f"{int(h):02d}:00" for h in thin_sample["hour"])
+    st.warning(f"⚠️ These hours have under 30 samples in your selected window — win rate is not statistically reliable yet: **{thin_list}**")
 
 st.divider()
 
