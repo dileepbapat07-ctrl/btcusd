@@ -42,6 +42,8 @@ TIMEZONES = {
 
 BUCKET_EDGES = [0, 100, 200, 300, 400, 500, float("inf")]
 BUCKET_LABELS = ["0-100", "100-200", "200-300", "300-400", "400-500", "500+"]
+REC_BUCKET_EDGES = [0, 200, 400, 600, float("inf")]
+REC_BUCKET_LABELS = ["<200", "200-400", "400-600", "600+"]
 
 
 @st.cache_data(ttl=60 * 30, show_spinner=False)
@@ -97,6 +99,7 @@ def fetch_klines(product_id: str, start_ms: int, end_ms: int) -> pd.DataFrame:
 def build_view(df: pd.DataFrame, tz_name: str) -> pd.DataFrame:
     out = df.copy()
     out["range"] = out["high"] - out["low"]
+    out["range_pct"] = (out["range"] / out["close"]) * 100
     out["local_time"] = out["open_time"].dt.tz_convert(ZoneInfo(tz_name))
     out["hour"] = out["local_time"].dt.hour
     out["dow"] = out["local_time"].dt.day_name()
@@ -150,6 +153,16 @@ with st.sidebar:
             lookback_days = 7
     tz_label = st.selectbox("Display timezone", list(TIMEZONES.keys()), index=1)
     tz_name = TIMEZONES[tz_label]
+    range_mode = st.radio(
+        "Range measured as",
+        ["% of price", "Absolute price ($)"],
+        index=0,
+        help=(
+            "% of price is comparable across coins at different price levels "
+            "(e.g. ETH's $13 range isn't the same 'size' of move as BTC's $13 "
+            "range). Absolute $ is easier to read if you only ever look at one coin."
+        ),
+    )
     st.caption(
         "Data source: Coinbase Exchange public API "
         "(`/products/{id}/candles`), no key required."
@@ -179,6 +192,30 @@ if raw.empty:
     st.stop()
 
 df = build_view(raw, tz_name)
+
+# ---- Active range-display mode: % of price (default) or absolute $ ----
+PCT_BUCKET_EDGES = [0, 0.1, 0.2, 0.3, 0.4, 0.5, float("inf")]
+PCT_BUCKET_LABELS = ["0-0.1%", "0.1-0.2%", "0.2-0.3%", "0.3-0.4%", "0.4-0.5%", "0.5%+"]
+PCT_REC_EDGES = [0, 0.2, 0.4, 0.6, float("inf")]
+PCT_REC_LABELS = ["<0.2%", "0.2-0.4%", "0.4-0.6%", "0.6%+"]
+
+if range_mode == "% of price":
+    df["display_range"] = df["range_pct"]
+    unit = "%"
+    ACTIVE_BUCKET_EDGES, ACTIVE_BUCKET_LABELS = PCT_BUCKET_EDGES, PCT_BUCKET_LABELS
+    ACTIVE_REC_EDGES, ACTIVE_REC_LABELS = PCT_REC_EDGES, PCT_REC_LABELS
+
+    def fmt(v):
+        return f"{v:.3f}%"
+else:
+    df["display_range"] = df["range"]
+    unit = "$"
+    ACTIVE_BUCKET_EDGES, ACTIVE_BUCKET_LABELS = BUCKET_EDGES, BUCKET_LABELS
+    ACTIVE_REC_EDGES, ACTIVE_REC_LABELS = REC_BUCKET_EDGES, REC_BUCKET_LABELS
+
+    def fmt(v):
+        return f"${v:,.0f}"
+
 
 st.success(
     f"Loaded {len(df):,} hourly candles "
@@ -210,12 +247,12 @@ st.caption(
 st.divider()
 
 # ---- Top line stats ----
-overall_max = df.loc[df["range"].idxmax()]
+overall_max = df.loc[df["display_range"].idxmax()]
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Max single-hour range", f"${overall_max['range']:,.0f}")
+c1.metric("Max single-hour range", fmt(overall_max["display_range"]))
 c2.metric("Max happened at", overall_max["local_time"].strftime("%Y-%m-%d %H:%M"))
-c3.metric("Median hourly range", f"${df['range'].median():,.0f}")
-c4.metric("Mean hourly range", f"${df['range'].mean():,.0f}")
+c3.metric("Median hourly range", fmt(df["display_range"].median()))
+c4.metric("Mean hourly range", fmt(df["display_range"].mean()))
 
 st.divider()
 
@@ -223,12 +260,12 @@ st.divider()
 hourly = (
     df.groupby("hour")
     .agg(
-        max_range=("range", "max"),
-        mean_range=("range", "mean"),
-        median_range=("range", "median"),
-        std_range=("range", "std"),
+        max_range=("display_range", "max"),
+        mean_range=("display_range", "mean"),
+        median_range=("display_range", "median"),
+        std_range=("display_range", "std"),
         mean_volume=("volume", "mean"),
-        count=("range", "count"),
+        count=("display_range", "count"),
     )
     .reindex(range(24))
     .reset_index()
@@ -239,16 +276,15 @@ st.divider()
 # ---- Recommended calm trading hours ----
 st.subheader(f"🎯 Recommended calm hours to trade ({tz_label})")
 st.caption(
-    "Ranked from the data you selected above, purely by how calm each hour's "
-    "price range historically was. This reflects **what already happened "
-    "historically** in this window — it is not a prediction, and it isn't "
-    "financial advice. Quiet hours can still spike on news."
+    f"Ranked from the data you selected above (range shown as **{unit}**), "
+    "purely by how calm each hour's price range historically was. This "
+    "reflects **what already happened historically** in this window — it "
+    "is not a prediction, and it isn't financial advice. Quiet hours can "
+    "still spike on news."
 )
 
-REC_BUCKET_EDGES = [0, 200, 400, 600, float("inf")]
-REC_BUCKET_LABELS = ["<200", "200-400", "400-600", "600+"]
-df["rec_bucket"] = pd.cut(df["range"], bins=REC_BUCKET_EDGES, labels=REC_BUCKET_LABELS, right=False)
-df["bucket"] = pd.cut(df["range"], bins=BUCKET_EDGES, labels=BUCKET_LABELS, right=False)
+df["rec_bucket"] = pd.cut(df["display_range"], bins=ACTIVE_REC_EDGES, labels=ACTIVE_REC_LABELS, right=False)
+df["bucket"] = pd.cut(df["display_range"], bins=ACTIVE_BUCKET_EDGES, labels=ACTIVE_BUCKET_LABELS, right=False)
 
 liquidity_threshold = hourly["mean_volume"].quantile(0.25)
 hourly["thin_liquidity"] = hourly["mean_volume"] < liquidity_threshold
@@ -267,30 +303,31 @@ hourly["calm_score"] = (0.7 * range_norm + 0.3 * std_norm) * 100
 ranked = hourly.sort_values("calm_score").reset_index(drop=True)
 top_calm = ranked.head(5)
 
-# Per-hour count of candles in each range bucket (e.g. "<200: 42, 200-400: 15, ...")
+# Per-hour count of candles in each range bucket (e.g. "<0.2%: 42, 0.2-0.4%: 15, ...")
 bucket_pivot = (
     df.groupby(["hour", "rec_bucket"], observed=True)
     .size()
     .unstack(fill_value=0)
-    .reindex(columns=REC_BUCKET_LABELS, fill_value=0)
+    .reindex(columns=ACTIVE_REC_LABELS, fill_value=0)
     .reindex(index=range(24), fill_value=0)
 )
 
 display_cols = pd.DataFrame({
     "Hour": top_calm["hour"].apply(lambda h: f"{int(h):02d}:00"),
-    "Avg range": top_calm["mean_range"].apply(lambda v: f"${v:,.0f}"),
-    "Max range seen": top_calm["max_range"].apply(lambda v: f"${v:,.0f}"),
-    "Consistency (std dev)": top_calm["std_range"].apply(lambda v: f"±${v:,.0f}"),
+    "Avg range": top_calm["mean_range"].apply(fmt),
+    "Max range seen": top_calm["max_range"].apply(fmt),
+    "Consistency (std dev)": top_calm["std_range"].apply(lambda v: f"±{fmt(v)}"),
 })
-for label in REC_BUCKET_LABELS:
+for label in ACTIVE_REC_LABELS:
     display_cols[label] = top_calm["hour"].apply(lambda h: int(bucket_pivot.loc[h, label]))
 display_cols["Avg volume"] = top_calm["mean_volume"].apply(lambda v: f"{v:,.1f}").values
 
 st.table(display_cols.set_index("Hour"))
+bucket_col_str = " / ".join(f"`{l}`" for l in ACTIVE_REC_LABELS)
 st.caption(
-    "The `<200` / `200-400` / `400-600` / `600+` columns show how many candles "
-    "in that hour fell into each range bucket — e.g. if `<200` is high and "
-    "`600+` is 0, the hour was consistently calm, not just calm on average."
+    f"The {bucket_col_str} columns show how many candles in that hour fell "
+    f"into each range bucket — e.g. if the lowest bucket is high and the "
+    f"highest is 0, the hour was consistently calm, not just calm on average."
 )
 
 low_vol_in_top = top_calm[top_calm["thin_liquidity"]]
@@ -310,6 +347,7 @@ st.caption(
     "big the gap is between your #1 and #2 choice."
 )
 sorted_by_calm = hourly.sort_values("calm_score", ascending=True)
+range_axis_label = f"Average range ({'%' if unit == '%' else 'USD'})"
 fig_ranked = px.bar(
     sorted_by_calm,
     x="mean_range",
@@ -317,9 +355,11 @@ fig_ranked = px.bar(
     orientation="h",
     color="calm_score",
     color_continuous_scale=["#2ca02c", "#f0e442", "#d62728"],
-    labels={"mean_range": "Average range (USD)", "y": "Hour", "calm_score": "Calm score"},
+    labels={"mean_range": range_axis_label, "y": "Hour", "calm_score": "Calm score"},
 )
 fig_ranked.update_layout(yaxis=dict(autorange="reversed"), coloraxis_showscale=False, height=600)
+if unit == "%":
+    fig_ranked.update_layout(xaxis=dict(ticksuffix="%"))
 st.plotly_chart(fig_ranked, use_container_width=True)
 
 st.markdown("#### Full distribution per hour (not just the average)")
@@ -332,24 +372,26 @@ st.caption(
 fig_box = px.box(
     df,
     x="hour",
-    y="range",
-    labels={"hour": f"Hour of day ({tz_label})", "range": "Range (USD)"},
+    y="display_range",
+    labels={"hour": f"Hour of day ({tz_label})", "display_range": range_axis_label.replace("Average ", "")},
     points="outliers",
 )
 fig_box.update_layout(xaxis=dict(tickmode="linear", dtick=1))
+if unit == "%":
+    fig_box.update_layout(yaxis=dict(ticksuffix="%"))
 st.plotly_chart(fig_box, use_container_width=True)
 
 st.markdown("#### Per-hour range breakdown (% of candles in each bucket)")
 st.caption(
-    "For each hour, what share of candles fell into each range bucket — e.g. "
-    "\"at 03:00, 62% of candles were under 100 pts, 28% were 100-200, only 2% "
-    "exceeded 400.\" This is the most direct way to compare how *often* an "
-    "hour stays calm, not just what it averages."
+    f"For each hour, what share of candles fell into each range bucket "
+    f"(buckets shown in **{unit}**, matching your selection above). This is "
+    f"the most direct way to compare how *often* an hour stays calm, not "
+    f"just what it averages on paper."
 )
 
 pct_table = (
     pd.crosstab(df["hour"], df["bucket"], normalize="index")
-    .reindex(columns=BUCKET_LABELS, fill_value=0)
+    .reindex(columns=ACTIVE_BUCKET_LABELS, fill_value=0)
     .reindex(index=range(24), fill_value=0)
     * 100
 )
@@ -359,7 +401,7 @@ fig_pct = px.bar(
     x="hour",
     y="pct",
     color="bucket",
-    category_orders={"bucket": BUCKET_LABELS},
+    category_orders={"bucket": ACTIVE_BUCKET_LABELS},
     labels={"hour": f"Hour of day ({tz_label})", "pct": "% of candles"},
 )
 fig_pct.update_layout(xaxis=dict(tickmode="linear", dtick=1), yaxis=dict(ticksuffix="%"), barmode="stack")
@@ -384,10 +426,12 @@ fig_max = px.bar(
     hourly,
     x="hour",
     y="max_range",
-    labels={"hour": f"Hour of day ({tz_label})", "max_range": "Max range (USD)"},
+    labels={"hour": f"Hour of day ({tz_label})", "max_range": f"Max range ({unit})"},
     title="Maximum hourly range seen, by hour of day",
 )
 fig_max.update_layout(xaxis=dict(tickmode="linear", dtick=1))
+if unit == "%":
+    fig_max.update_layout(yaxis=dict(ticksuffix="%"))
 st.plotly_chart(fig_max, use_container_width=True)
 
 fig_mean = px.bar(
@@ -398,19 +442,21 @@ fig_mean = px.bar(
     color_discrete_map={True: "#d3a625", False: "#1f77b4"},
     labels={
         "hour": f"Hour of day ({tz_label})",
-        "mean_range": "Average range (USD)",
+        "mean_range": f"Average range ({unit})",
         "thin_liquidity": "Low volume (bottom 25%)",
     },
     title="Average hourly range, by hour of day (typical movement)",
 )
 fig_mean.update_layout(xaxis=dict(tickmode="linear", dtick=1))
+if unit == "%":
+    fig_mean.update_layout(yaxis=dict(ticksuffix="%"))
 st.plotly_chart(fig_mean, use_container_width=True)
 
 st.divider()
 
 # ---- Bucket distribution ----
 st.subheader("Range buckets by hour of day")
-st.caption("Each hourly candle is bucketed by its high-low range in USD points.")
+st.caption(f"Each hourly candle is bucketed by its high-low range, shown in {unit}.")
 
 bucket_counts = (
     df.groupby(["hour", "bucket"], observed=True)
@@ -423,7 +469,7 @@ fig_bucket = px.bar(
     x="hour",
     y="count",
     color="bucket",
-    category_orders={"bucket": BUCKET_LABELS},
+    category_orders={"bucket": ACTIVE_BUCKET_LABELS},
     labels={"hour": f"Hour of day ({tz_label})", "count": "Number of candles"},
     title="Distribution of candle-range buckets across the day",
 )
@@ -431,7 +477,7 @@ fig_bucket.update_layout(xaxis=dict(tickmode="linear", dtick=1))
 st.plotly_chart(fig_bucket, use_container_width=True)
 
 st.subheader("Overall bucket breakdown (whole window)")
-total_bucket = df["bucket"].value_counts().reindex(BUCKET_LABELS).fillna(0).astype(int)
+total_bucket = df["bucket"].value_counts().reindex(ACTIVE_BUCKET_LABELS).fillna(0).astype(int)
 total_bucket_pct = (total_bucket / total_bucket.sum() * 100).round(1)
 summary_df = pd.DataFrame({"candles": total_bucket, "% of hours": total_bucket_pct})
 st.dataframe(summary_df, use_container_width=True)
@@ -440,7 +486,7 @@ st.divider()
 
 # ---- Raw table + download ----
 with st.expander("Raw hourly data (sortable table)"):
-    show_cols = ["local_time", "dow", "hour", "open", "high", "low", "close", "range", "bucket"]
+    show_cols = ["local_time", "dow", "hour", "open", "high", "low", "close", "range", "range_pct", "bucket"]
     st.dataframe(
         df[show_cols].sort_values("local_time", ascending=False),
         use_container_width=True,
