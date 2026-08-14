@@ -163,6 +163,20 @@ with st.sidebar:
             "range). Absolute $ is easier to read if you only ever look at one coin."
         ),
     )
+    unit = "%" if range_mode == "% of price" else "$"
+
+    st.subheader("Target range (for win rate)")
+    if unit == "%":
+        wr_lo, wr_hi = st.slider(
+            "Band you'd bet the range stays inside",
+            min_value=0.0, max_value=2.0, value=(0.0, 0.4), step=0.05, format="%.2f%%",
+        )
+    else:
+        wr_lo, wr_hi = st.slider(
+            "Band you'd bet the range stays inside ($)",
+            min_value=0, max_value=2000, value=(0, 300), step=10,
+        )
+
     st.caption(
         "Data source: Coinbase Exchange public API "
         "(`/products/{id}/candles`), no key required."
@@ -217,6 +231,111 @@ else:
         return f"${v:,.0f}"
 
 
+df["rec_bucket"] = pd.cut(df["display_range"], bins=ACTIVE_REC_EDGES, labels=ACTIVE_REC_LABELS, right=False)
+df["bucket"] = pd.cut(df["display_range"], bins=ACTIVE_BUCKET_EDGES, labels=ACTIVE_BUCKET_LABELS, right=False)
+
+# ---- Per-hour-of-day stats (computed once, reused everywhere below) ----
+hourly = (
+    df.groupby("hour")
+    .agg(
+        max_range=("display_range", "max"),
+        mean_range=("display_range", "mean"),
+        median_range=("display_range", "median"),
+        std_range=("display_range", "std"),
+        mean_volume=("volume", "mean"),
+        count=("display_range", "count"),
+    )
+    .reindex(range(24))
+    .reset_index()
+)
+
+liquidity_threshold = hourly["mean_volume"].quantile(0.25)
+hourly["thin_liquidity"] = hourly["mean_volume"] < liquidity_threshold
+
+# Calmness score: primarily average range, with a penalty for inconsistency
+# (a hour that's usually calm but occasionally spikes hard is riskier than
+# one that's consistently calm), normalized 0-100 (lower = calmer).
+range_norm = (hourly["mean_range"] - hourly["mean_range"].min()) / (
+    hourly["mean_range"].max() - hourly["mean_range"].min() + 1e-9
+)
+std_norm = (hourly["std_range"] - hourly["std_range"].min()) / (
+    hourly["std_range"].max() - hourly["std_range"].min() + 1e-9
+)
+hourly["calm_score"] = (0.7 * range_norm + 0.3 * std_norm) * 100
+ranked = hourly.sort_values("calm_score").reset_index(drop=True)
+
+# ---- Win rate for the target band chosen in the sidebar ----
+hit = df.groupby("hour")["display_range"].apply(lambda s: ((s >= wr_lo) & (s <= wr_hi)).mean() * 100)
+n_obs = df.groupby("hour")["display_range"].count()
+hit_df = pd.DataFrame({"hour": range(24)}).merge(
+    hit.rename("win_rate").reset_index(), on="hour", how="left"
+).merge(n_obs.rename("n").reset_index(), on="hour", how="left").fillna(0)
+
+# Wilson 95% confidence interval — accounts for sample size, so a 90%
+# win rate on 10 candles doesn't look as trustworthy as 90% on 500 candles.
+z = 1.96
+p = hit_df["win_rate"] / 100
+n = hit_df["n"].replace(0, pd.NA)
+denom = 1 + z**2 / n
+center = p + z**2 / (2 * n)
+adj = z * ((p * (1 - p) + z**2 / (4 * n)) / n) ** 0.5
+hit_df["ci_low"] = ((center - adj) / denom * 100).fillna(0)
+hit_df["ci_high"] = ((center + adj) / denom * 100).fillna(0)
+
+# ---- Full verdict table (Calm/Volatile + trade-worthiness), computed once ----
+verdict = hourly[["hour", "calm_score", "mean_range", "thin_liquidity"]].merge(
+    hit_df[["hour", "win_rate", "ci_low", "ci_high", "n"]], on="hour", how="left"
+)
+calm_q1, calm_q2 = verdict["calm_score"].quantile([1 / 3, 2 / 3])
+
+def calm_label(score):
+    if score <= calm_q1:
+        return "🟢 Calm"
+    elif score <= calm_q2:
+        return "🟡 Moderate"
+    return "🔴 Volatile"
+
+verdict["Calm/Volatile"] = verdict["calm_score"].apply(calm_label)
+verdict["ci_width"] = verdict["ci_high"] - verdict["ci_low"]
+verdict["reliable"] = (verdict["n"] >= 30) & (verdict["ci_width"] <= 25)
+
+# ---- Volatility regime detection (computed early; charts rendered further down) ----
+daily = (
+    df.groupby(df["local_time"].dt.date)["display_range"]
+    .mean()
+    .rename("daily_avg")
+    .reset_index()
+    .rename(columns={"local_time": "date"})
+    .sort_values("date")
+)
+daily["date"] = pd.to_datetime(daily["date"])
+daily["roll7"] = daily["daily_avg"].rolling(7, min_periods=3).mean()
+daily["roll30"] = daily["daily_avg"].rolling(30, min_periods=10).mean()
+
+whole_median = df["display_range"].median()
+whole_mean = df["display_range"].mean()
+
+n_days = len(daily)
+regime_hot = False
+ratio = 1.0
+recent_avg = whole_mean
+recent_n = 0
+if n_days >= 3:
+    recent_n = min(7, n_days)
+    recent_avg = daily["daily_avg"].tail(recent_n).mean()
+    ratio = recent_avg / whole_mean if whole_mean else 1.0
+    regime_hot = ratio >= 1.3
+
+def verdict_call(row):
+    if row["calm_score"] <= calm_q1 and row["win_rate"] >= 70 and row["reliable"] and not row["thin_liquidity"]:
+        return "✅ Good to trade" if not regime_hot else "⚠️ Good historically, but regime is hot now"
+    if row["calm_score"] > calm_q2 or row["win_rate"] < 50:
+        return "❌ Avoid"
+    return "⚠️ Caution"
+
+verdict["Verdict"] = verdict.apply(verdict_call, axis=1)
+
+
 st.success(
     f"Loaded {len(df):,} hourly candles "
     f"({df['open_time'].min().date()} to {df['open_time'].max().date()})"
@@ -246,6 +365,40 @@ st.caption(
 
 st.divider()
 
+# ---- Right now: is this a calm hour? ----
+now_local = datetime.now(ZoneInfo(tz_name))
+current_hour = now_local.hour
+now_row = verdict[verdict["hour"] == current_hour].iloc[0]
+
+banner_map = {
+    "✅ Good to trade": "success",
+    "⚠️ Good historically, but regime is hot now": "warning",
+    "⚠️ Caution": "warning",
+    "❌ Avoid": "error",
+}
+banner_fn = getattr(st, banner_map.get(now_row["Verdict"], "info"))
+
+st.markdown(f"### 🕐 Right now: {now_local.strftime('%H:%M')} {tz_label.split(' ')[0]} — hour {current_hour:02d}:00")
+banner_fn(
+    f"**{now_row['Calm/Volatile']} — {now_row['Verdict']}**  \n"
+    f"Historical avg range this hour: **{fmt(now_row['mean_range'])}**  •  "
+    f"Win rate for your [{wr_lo}, {wr_hi}]{unit} band: **{now_row['win_rate']:.0f}%** "
+    f"(95% CI: {now_row['ci_low']:.0f}%–{now_row['ci_high']:.0f}%, n={int(now_row['n'])})  •  "
+    f"Liquidity: {'⚠️ thin' if now_row['thin_liquidity'] else 'OK'}"
+)
+if regime_hot:
+    st.caption(
+        f"⚠️ Note: current volatility regime is running hot ({ratio:.2f}x the "
+        f"window average) — historical patterns above may be less reliable "
+        f"than usual right now."
+    )
+st.caption(
+    "This re-evaluates automatically each time you reload — it's just today's "
+    "hour looked up in the same historical stats shown in detail below."
+)
+
+st.divider()
+
 # ---- Top line stats ----
 overall_max = df.loc[df["display_range"].idxmax()]
 c1, c2, c3, c4 = st.columns(4)
@@ -266,27 +419,7 @@ st.caption(
     "above still reflect current conditions."
 )
 
-daily = (
-    df.groupby(df["local_time"].dt.date)["display_range"]
-    .mean()
-    .rename("daily_avg")
-    .reset_index()
-    .rename(columns={"local_time": "date"})
-    .sort_values("date")
-)
-daily["date"] = pd.to_datetime(daily["date"])
-daily["roll7"] = daily["daily_avg"].rolling(7, min_periods=3).mean()
-daily["roll30"] = daily["daily_avg"].rolling(30, min_periods=10).mean()
-
-whole_median = df["display_range"].median()
-whole_mean = df["display_range"].mean()
-
-n_days = len(daily)
 if n_days >= 3:
-    recent_n = min(7, n_days)
-    recent_avg = daily["daily_avg"].tail(recent_n).mean()
-    ratio = recent_avg / whole_mean if whole_mean else 1.0
-
     if ratio >= 1.3:
         regime_label, regime_color = "🔥 Elevated — running hotter than usual", "error"
     elif ratio <= 0.7:
@@ -349,21 +482,6 @@ st.caption(
 
 st.divider()
 
-# ---- Per-hour-of-day summary ----
-hourly = (
-    df.groupby("hour")
-    .agg(
-        max_range=("display_range", "max"),
-        mean_range=("display_range", "mean"),
-        median_range=("display_range", "median"),
-        std_range=("display_range", "std"),
-        mean_volume=("volume", "mean"),
-        count=("display_range", "count"),
-    )
-    .reindex(range(24))
-    .reset_index()
-)
-
 st.divider()
 
 # ---- Recommended calm trading hours ----
@@ -376,24 +494,6 @@ st.caption(
     "still spike on news."
 )
 
-df["rec_bucket"] = pd.cut(df["display_range"], bins=ACTIVE_REC_EDGES, labels=ACTIVE_REC_LABELS, right=False)
-df["bucket"] = pd.cut(df["display_range"], bins=ACTIVE_BUCKET_EDGES, labels=ACTIVE_BUCKET_LABELS, right=False)
-
-liquidity_threshold = hourly["mean_volume"].quantile(0.25)
-hourly["thin_liquidity"] = hourly["mean_volume"] < liquidity_threshold
-
-# Calmness score: primarily average range, with a penalty for inconsistency
-# (a hour that's usually calm but occasionally spikes hard is riskier than
-# one that's consistently calm), normalized 0-100 (lower = calmer).
-range_norm = (hourly["mean_range"] - hourly["mean_range"].min()) / (
-    hourly["mean_range"].max() - hourly["mean_range"].min() + 1e-9
-)
-std_norm = (hourly["std_range"] - hourly["std_range"].min()) / (
-    hourly["std_range"].max() - hourly["std_range"].min() + 1e-9
-)
-hourly["calm_score"] = (0.7 * range_norm + 0.3 * std_norm) * 100
-
-ranked = hourly.sort_values("calm_score").reset_index(drop=True)
 top_calm = ranked.head(5)
 
 # Per-hour count of candles in each range bucket (e.g. "<0.2%: 42, 0.2-0.4%: 15, ...")
@@ -523,34 +623,7 @@ st.caption(
     "this window's average, and the exact settlement window/reference price "
     "a contract uses may not exactly match this hourly candle definition."
 )
-
-if unit == "%":
-    wr_lo, wr_hi = st.slider(
-        "Target range band (won if actual range falls inside this band)",
-        min_value=0.0, max_value=2.0, value=(0.0, 0.4), step=0.05, format="%.2f%%",
-    )
-else:
-    wr_lo, wr_hi = st.slider(
-        "Target range band ($, won if actual range falls inside this band)",
-        min_value=0, max_value=2000, value=(0, 300), step=10,
-    )
-
-hit = df.groupby("hour")["display_range"].apply(lambda s: ((s >= wr_lo) & (s <= wr_hi)).mean() * 100)
-n_obs = df.groupby("hour")["display_range"].count()
-hit_df = pd.DataFrame({"hour": range(24)}).merge(
-    hit.rename("win_rate").reset_index(), on="hour", how="left"
-).merge(n_obs.rename("n").reset_index(), on="hour", how="left").fillna(0)
-
-# Wilson 95% confidence interval — accounts for sample size, so a 90%
-# win rate on 10 candles doesn't look as trustworthy as 90% on 500 candles.
-z = 1.96
-p = hit_df["win_rate"] / 100
-n = hit_df["n"].replace(0, pd.NA)
-denom = 1 + z**2 / n
-center = p + z**2 / (2 * n)
-adj = z * ((p * (1 - p) + z**2 / (4 * n)) / n) ** 0.5
-hit_df["ci_low"] = ((center - adj) / denom * 100).fillna(0)
-hit_df["ci_high"] = ((center + adj) / denom * 100).fillna(0)
+st.info(f"Using the target band set in the sidebar: **[{wr_lo}, {wr_hi}]{unit}**")
 
 hit_sorted = hit_df.sort_values("win_rate", ascending=False)
 
@@ -586,6 +659,47 @@ thin_sample = hit_df[hit_df["n"] < 30]
 if not thin_sample.empty:
     thin_list = ", ".join(f"{int(h):02d}:00" for h in thin_sample["hour"])
     st.warning(f"⚠️ These hours have under 30 samples in your selected window — win rate is not statistically reliable yet: **{thin_list}**")
+
+st.divider()
+
+# ---- Final verdict: calm/volatile + trade-worthiness, hour by hour ----
+st.subheader(f"🏁 Final verdict, hour by hour ({tz_label})")
+st.caption(
+    "Everything above, combined into one call per hour: how calm it is, how "
+    "often your target band actually held, whether that rate is statistically "
+    "reliable, and whether liquidity or the current volatility regime should "
+    "make you hesitate. This is a summary of historical patterns, not a "
+    "trading signal — use it to narrow down candidates, then apply your own "
+    "judgment and risk management."
+)
+
+verdict_display = pd.DataFrame({
+    "Hour": verdict["hour"].apply(lambda h: f"{int(h):02d}:00"),
+    "Calm/Volatile": verdict["Calm/Volatile"],
+    "Avg range": verdict["mean_range"].apply(fmt),
+    "Win rate (your band)": verdict["win_rate"].apply(lambda v: f"{v:.0f}%"),
+    "Confidence": verdict.apply(
+        lambda r: "Reliable" if r["reliable"] else f"Uncertain (n={int(r['n'])})", axis=1
+    ),
+    "Liquidity": verdict["thin_liquidity"].apply(lambda t: "⚠️ Thin" if t else "OK"),
+    "Verdict": verdict["Verdict"],
+}).set_index("Hour")
+
+st.dataframe(verdict_display, use_container_width=True, height=880)
+
+good_hours = verdict[verdict["Verdict"] == "✅ Good to trade"]["hour"]
+if not good_hours.empty:
+    good_list = ", ".join(f"{int(h):02d}:00" for h in sorted(good_hours))
+    st.success(f"✅ Hours that pass every check (calm + high win rate + reliable + liquid): **{good_list}**")
+elif regime_hot:
+    st.warning(
+        "⚠️ Some hours look historically good, but the current volatility regime is "
+        "running hot (see the regime check above) — none get an unqualified green light "
+        "right now. Consider waiting for volatility to normalize, or re-check with a shorter, "
+        "more recent window."
+    )
+else:
+    st.info("No hour currently passes every check — try widening your target range band, or extending the lookback window for more reliable statistics.")
 
 st.divider()
 
