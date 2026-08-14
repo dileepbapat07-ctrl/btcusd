@@ -155,27 +155,16 @@ with st.sidebar:
     tz_name = TIMEZONES[tz_label]
     range_mode = st.radio(
         "Range measured as",
-        ["% of price", "Absolute price ($)"],
+        ["Absolute price ($)", "% of price"],
         index=0,
         help=(
-            "% of price is comparable across coins at different price levels "
-            "(e.g. ETH's $13 range isn't the same 'size' of move as BTC's $13 "
-            "range). Absolute $ is easier to read if you only ever look at one coin."
+            "Absolute $ gives you real number ranges (e.g. 'usually moves "
+            "$120-$340') — most useful when you're reading raw stats yourself. "
+            "% of price is only for comparing calmness across different coins "
+            "at very different price levels."
         ),
     )
-    unit = "%" if range_mode == "% of price" else "$"
-
-    st.subheader("Target range (for win rate)")
-    if unit == "%":
-        wr_lo, wr_hi = st.slider(
-            "Band you'd bet the range stays inside",
-            min_value=0.0, max_value=2.0, value=(0.0, 0.4), step=0.05, format="%.2f%%",
-        )
-    else:
-        wr_lo, wr_hi = st.slider(
-            "Band you'd bet the range stays inside ($)",
-            min_value=0, max_value=2000, value=(0, 300), step=10,
-        )
+    unit = "$" if range_mode == "Absolute price ($)" else "%"
 
     st.caption(
         "Data source: Coinbase Exchange public API "
@@ -264,40 +253,22 @@ std_norm = (hourly["std_range"] - hourly["std_range"].min()) / (
 hourly["calm_score"] = (0.7 * range_norm + 0.3 * std_norm) * 100
 ranked = hourly.sort_values("calm_score").reset_index(drop=True)
 
-# ---- Win rate for the target band chosen in the sidebar ----
-hit = df.groupby("hour")["display_range"].apply(lambda s: ((s >= wr_lo) & (s <= wr_hi)).mean() * 100)
-n_obs = df.groupby("hour")["display_range"].count()
-hit_df = pd.DataFrame({"hour": range(24)}).merge(
-    hit.rename("win_rate").reset_index(), on="hour", how="left"
-).merge(n_obs.rename("n").reset_index(), on="hour", how="left").fillna(0)
+# Typical number range per hour (25th-75th percentile) — "usually moves
+# between X and Y" — this is the actual data-driven range, not a single
+# average, so you can see the real spread and decide your own thresholds.
+p25 = df.groupby("hour")["display_range"].quantile(0.25).reindex(range(24)).reset_index(name="p25")
+p75 = df.groupby("hour")["display_range"].quantile(0.75).reindex(range(24)).reset_index(name="p75")
+p10 = df.groupby("hour")["display_range"].quantile(0.10).reindex(range(24)).reset_index(name="p10")
+p90 = df.groupby("hour")["display_range"].quantile(0.90).reindex(range(24)).reset_index(name="p90")
+hourly = hourly.merge(p25, on="hour").merge(p75, on="hour").merge(p10, on="hour").merge(p90, on="hour")
 
-# Wilson 95% confidence interval — accounts for sample size, so a 90%
-# win rate on 10 candles doesn't look as trustworthy as 90% on 500 candles.
-z = 1.96
-p = hit_df["win_rate"] / 100
-n = hit_df["n"].replace(0, pd.NA)
-denom = 1 + z**2 / n
-center = p + z**2 / (2 * n)
-adj = z * ((p * (1 - p) + z**2 / (4 * n)) / n) ** 0.5
-hit_df["ci_low"] = ((center - adj) / denom * 100).fillna(0)
-hit_df["ci_high"] = ((center + adj) / denom * 100).fillna(0)
-
-# ---- Full verdict table (Calm/Volatile + trade-worthiness), computed once ----
-verdict = hourly[["hour", "calm_score", "mean_range", "thin_liquidity"]].merge(
-    hit_df[["hour", "win_rate", "ci_low", "ci_high", "n"]], on="hour", how="left"
-)
-calm_q1, calm_q2 = verdict["calm_score"].quantile([1 / 3, 2 / 3])
+# ---- Simple binary verdict: Calm or Not Calm, based on relative rank ----
+calm_median = hourly["calm_score"].median()
 
 def calm_label(score):
-    if score <= calm_q1:
-        return "🟢 Calm"
-    elif score <= calm_q2:
-        return "🟡 Moderate"
-    return "🔴 Volatile"
+    return "🟢 Calm" if score <= calm_median else "🔴 Not Calm"
 
-verdict["Calm/Volatile"] = verdict["calm_score"].apply(calm_label)
-verdict["ci_width"] = verdict["ci_high"] - verdict["ci_low"]
-verdict["reliable"] = (verdict["n"] >= 30) & (verdict["ci_width"] <= 25)
+hourly["Verdict"] = hourly["calm_score"].apply(calm_label)
 
 # ---- Volatility regime detection (computed early; charts rendered further down) ----
 daily = (
@@ -325,15 +296,6 @@ if n_days >= 3:
     recent_avg = daily["daily_avg"].tail(recent_n).mean()
     ratio = recent_avg / whole_mean if whole_mean else 1.0
     regime_hot = ratio >= 1.3
-
-def verdict_call(row):
-    if row["calm_score"] <= calm_q1 and row["win_rate"] >= 70 and row["reliable"] and not row["thin_liquidity"]:
-        return "✅ Good to trade" if not regime_hot else "⚠️ Good historically, but regime is hot now"
-    if row["calm_score"] > calm_q2 or row["win_rate"] < 50:
-        return "❌ Avoid"
-    return "⚠️ Caution"
-
-verdict["Verdict"] = verdict.apply(verdict_call, axis=1)
 
 
 st.success(
@@ -368,23 +330,18 @@ st.divider()
 # ---- Right now: is this a calm hour? ----
 now_local = datetime.now(ZoneInfo(tz_name))
 current_hour = now_local.hour
-now_row = verdict[verdict["hour"] == current_hour].iloc[0]
+now_row = hourly[hourly["hour"] == current_hour].iloc[0]
 
-banner_map = {
-    "✅ Good to trade": "success",
-    "⚠️ Good historically, but regime is hot now": "warning",
-    "⚠️ Caution": "warning",
-    "❌ Avoid": "error",
-}
-banner_fn = getattr(st, banner_map.get(now_row["Verdict"], "info"))
+banner_fn = st.success if now_row["Verdict"] == "🟢 Calm" else st.error
 
 st.markdown(f"### 🕐 Right now: {now_local.strftime('%H:%M')} {tz_label.split(' ')[0]} — hour {current_hour:02d}:00")
 banner_fn(
-    f"**{now_row['Calm/Volatile']} — {now_row['Verdict']}**  \n"
-    f"Historical avg range this hour: **{fmt(now_row['mean_range'])}**  •  "
-    f"Win rate for your [{wr_lo}, {wr_hi}]{unit} band: **{now_row['win_rate']:.0f}%** "
-    f"(95% CI: {now_row['ci_low']:.0f}%–{now_row['ci_high']:.0f}%, n={int(now_row['n'])})  •  "
-    f"Liquidity: {'⚠️ thin' if now_row['thin_liquidity'] else 'OK'}"
+    f"**{now_row['Verdict']}** (vs the rest of the day)  \n"
+    f"Avg range: **{fmt(now_row['mean_range'])}**  •  "
+    f"Typical range (25th–75th pct): **{fmt(now_row['p25'])} – {fmt(now_row['p75'])}**  •  "
+    f"Widest range seen: **{fmt(now_row['max_range'])}**  \n"
+    f"Liquidity: {'⚠️ thin' if now_row['thin_liquidity'] else 'OK'}  •  "
+    f"Sample size: {int(now_row['count'])} candles"
 )
 if regime_hot:
     st.caption(
@@ -612,94 +569,42 @@ st.error(f"🔥 Historically most volatile hours in this window — avoid if you
 
 st.divider()
 
-# ---- Target range "win rate" (e.g. for Kalshi-style range prediction) ----
-st.subheader(f"🎯 Historical win rate for a target range ({unit})")
+# ---- All 24 hours: stats + Calm/Not Calm verdict ----
+st.subheader(f"🏁 All 24 hours: stats and verdict ({tz_label})")
 st.caption(
-    "For range-prediction markets (e.g. Kalshi-style 'will the range stay "
-    "under X') this shows how often each hour's *actual* historical range "
-    "landed inside a band you choose. This is a **base rate from the past**, "
-    "not a guaranteed future probability — market makers price these "
-    "contracts using their own models, current volatility can differ from "
-    "this window's average, and the exact settlement window/reference price "
-    "a contract uses may not exactly match this hourly candle definition."
-)
-st.info(f"Using the target band set in the sidebar: **[{wr_lo}, {wr_hi}]{unit}**")
-
-hit_sorted = hit_df.sort_values("win_rate", ascending=False)
-
-fig_hit = px.bar(
-    hit_sorted,
-    x=hit_sorted["hour"].apply(lambda h: f"{int(h):02d}:00"),
-    y="win_rate",
-    error_y=hit_sorted["ci_high"] - hit_sorted["win_rate"],
-    error_y_minus=hit_sorted["win_rate"] - hit_sorted["ci_low"],
-    labels={"x": f"Hour of day ({tz_label})", "win_rate": "Historical win rate"},
-    title=f"How often the range stayed within [{wr_lo}, {wr_hi}]{unit}, by hour",
-)
-fig_hit.update_layout(yaxis=dict(ticksuffix="%", range=[0, 100]))
-st.plotly_chart(fig_hit, use_container_width=True)
-
-best5 = hit_sorted.head(5)
-win_table = pd.DataFrame({
-    "Hour": best5["hour"].apply(lambda h: f"{int(h):02d}:00"),
-    "Win rate": best5["win_rate"].apply(lambda v: f"{v:.1f}%"),
-    "95% confidence range": best5.apply(lambda r: f"{r['ci_low']:.1f}% – {r['ci_high']:.1f}%", axis=1),
-    "Sample size": best5["n"].apply(lambda v: f"{int(v)} candles"),
-})
-st.table(win_table.set_index("Hour"))
-st.caption(
-    "**How to read the confidence range:** a narrow gap (e.g. 78%–85%) means "
-    "the win rate is well-supported by enough data to trust it. A wide gap "
-    "(e.g. 60%–95%) means the sample size is too small to be confident — the "
-    "true rate could be much lower than the headline number shows. As a "
-    "rule of thumb, treat anything under ~50 candles with real caution."
+    "Raw stats per hour, plus a Calm / Not Calm call based on how this hour "
+    "ranks against the other 23 (below the median calmness score = Calm). "
+    "The **typical range** (25th–75th percentile) and **90% range** (10th–90th "
+    "percentile) show you the real spread of outcomes, not just one average "
+    "number — use these to set your own thresholds. This is historical "
+    "pattern data, not a prediction or trading signal."
 )
 
-thin_sample = hit_df[hit_df["n"] < 30]
-if not thin_sample.empty:
-    thin_list = ", ".join(f"{int(h):02d}:00" for h in thin_sample["hour"])
-    st.warning(f"⚠️ These hours have under 30 samples in your selected window — win rate is not statistically reliable yet: **{thin_list}**")
-
-st.divider()
-
-# ---- Final verdict: calm/volatile + trade-worthiness, hour by hour ----
-st.subheader(f"🏁 Final verdict, hour by hour ({tz_label})")
-st.caption(
-    "Everything above, combined into one call per hour: how calm it is, how "
-    "often your target band actually held, whether that rate is statistically "
-    "reliable, and whether liquidity or the current volatility regime should "
-    "make you hesitate. This is a summary of historical patterns, not a "
-    "trading signal — use it to narrow down candidates, then apply your own "
-    "judgment and risk management."
-)
-
-verdict_display = pd.DataFrame({
-    "Hour": verdict["hour"].apply(lambda h: f"{int(h):02d}:00"),
-    "Calm/Volatile": verdict["Calm/Volatile"],
-    "Avg range": verdict["mean_range"].apply(fmt),
-    "Win rate (your band)": verdict["win_rate"].apply(lambda v: f"{v:.0f}%"),
-    "Confidence": verdict.apply(
-        lambda r: "Reliable" if r["reliable"] else f"Uncertain (n={int(r['n'])})", axis=1
-    ),
-    "Liquidity": verdict["thin_liquidity"].apply(lambda t: "⚠️ Thin" if t else "OK"),
-    "Verdict": verdict["Verdict"],
+hourly_sorted = hourly.sort_values("calm_score")
+stats_display = pd.DataFrame({
+    "Hour": hourly_sorted["hour"].apply(lambda h: f"{int(h):02d}:00"),
+    "Verdict": hourly_sorted["Verdict"],
+    "Avg": hourly_sorted["mean_range"].apply(fmt),
+    "Median": hourly_sorted["median_range"].apply(fmt),
+    "Typical range (25–75pct)": hourly_sorted.apply(lambda r: f"{fmt(r['p25'])} – {fmt(r['p75'])}", axis=1),
+    "90% range (10–90pct)": hourly_sorted.apply(lambda r: f"{fmt(r['p10'])} – {fmt(r['p90'])}", axis=1),
+    "Max seen": hourly_sorted["max_range"].apply(fmt),
+    "Std dev": hourly_sorted["std_range"].apply(lambda v: f"±{fmt(v)}"),
+    "Liquidity": hourly_sorted["thin_liquidity"].apply(lambda t: "⚠️ Thin" if t else "OK"),
+    "Sample": hourly_sorted["count"].apply(lambda v: f"{int(v)} candles"),
 }).set_index("Hour")
 
-st.dataframe(verdict_display, use_container_width=True, height=880)
+st.dataframe(stats_display, use_container_width=True, height=880)
 
-good_hours = verdict[verdict["Verdict"] == "✅ Good to trade"]["hour"]
-if not good_hours.empty:
-    good_list = ", ".join(f"{int(h):02d}:00" for h in sorted(good_hours))
-    st.success(f"✅ Hours that pass every check (calm + high win rate + reliable + liquid): **{good_list}**")
-elif regime_hot:
+calm_hours = hourly[hourly["Verdict"] == "🟢 Calm"]["hour"]
+calm_list = ", ".join(f"{int(h):02d}:00" for h in sorted(calm_hours))
+st.success(f"🟢 Calm hours (below-median calmness score): **{calm_list}**")
+if regime_hot:
     st.warning(
-        "⚠️ Some hours look historically good, but the current volatility regime is "
-        "running hot (see the regime check above) — none get an unqualified green light "
-        "right now. Consider waiting for volatility to normalize, or re-check with a shorter, "
-        "more recent window."
+        f"⚠️ Current volatility regime is running hot ({ratio:.2f}x the window "
+        f"average) — treat the table above with extra caution right now, it's "
+        f"based on the whole window which may include calmer periods than today."
     )
-else:
-    st.info("No hour currently passes every check — try widening your target range band, or extending the lookback window for more reliable statistics.")
 
 st.divider()
 
